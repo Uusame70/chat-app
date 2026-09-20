@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Canlı Sohbet</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, Arial, sans-serif;
+      margin: 0;
+      background: #f0f2f5;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    header {
+      background: #007bff;
+      color: white;
+      padding: 12px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    header h1 { font-size: 17px; margin: 0; }
+    header .status { font-size: 13px; opacity: 0.9; }
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      list-style: none;
+      padding: 16px;
+      margin: 0;
+    }
+    #messages li {
+      padding: 8px 12px;
+      background: #fff;
+      border-radius: 12px;
+      margin-bottom: 8px;
+      max-width: 75%;
+      word-wrap: break-word;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+    }
+    #messages li.mine {
+      background: #d1e7ff;
+      margin-left: auto;
+    }
+    #messages li.system {
+      background: transparent;
+      box-shadow: none;
+      color: #666;
+      font-size: 13px;
+      text-align: center;
+      max-width: 100%;
+      font-style: italic;
+    }
+    #messages li .user {
+      font-weight: bold;
+      font-size: 12px;
+      color: #007bff;
+      display: block;
+      margin-bottom: 2px;
+    }
+    #typing {
+      height: 20px;
+      padding: 0 16px;
+      font-size: 13px;
+      color: #666;
+      font-style: italic;
+    }
+    form {
+      display: flex;
+      gap: 8px;
+      padding: 10px;
+      background: #fff;
+      border-top: 1px solid #ddd;
+    }
+    input {
+      flex: 1;
+      padding: 12px;
+      border: 1px solid #ccc;
+      border-radius: 20px;
+      font-size: 15px;
+      outline: none;
+    }
+    input:focus { border-color: #007bff; }
+    button {
+      padding: 12px 20px;
+      border: 0;
+      border-radius: 20px;
+      background: #007bff;
+      color: white;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    button:hover { background: #0062cc; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>💬 Canlı Sohbet</h1>
+    <span class="status" id="status">Bağlanıyor...</span>
+  </header>
+
+  <ul id="messages"></ul>
+  <div id="typing"></div>
+
+  <form id="form">
+    <input id="input" autocomplete="off" placeholder="Mesaj yaz..." />
+    <button type="submit">Gönder</button>
+  </form>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    const form = document.getElementById('form');
+    const input = document.getElementById('input');
+    const messages = document.getElementById('messages');
+    const typingEl = document.getElementById('typing');
+    const statusEl = document.getElementById('status');
+
+    const username = prompt('Kullanıcı adın:')?.trim() || 'Anonim';
+    socket.emit('set username', username);
+
+    let typingTimer;
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+      socket.emit('chat message', { user: username, text });
+      input.value = '';
+      socket.emit('stop typing');
+    });
+
+    input.addEventListener('input', () => {
+      socket.emit('typing', username);
+      clearTimeout(typingTimer);
+      typingTimer = setTimeout(() => socket.emit('stop typing'), 1200);
+    });
+
+    socket.on('chat message', (data) => {
+      const li = document.createElement('li');
+      if (data.user === username) li.classList.add('mine');
+      li.innerHTML = `<span class="user">${escapeHtml(data.user)}</span>${escapeHtml(data.text)}`;
+      messages.appendChild(li);
+      messages.scrollTop = messages.scrollHeight;
+    });
+
+    socket.on('system message', (text) => {
+      const li = document.createElement('li');
+      li.classList.add('system');
+      li.textContent = text;
+      messages.appendChild(li);
+      messages.scrollTop = messages.scrollHeight;
+    });
+
+    socket.on('typing', (user) => { typingEl.textContent = `${user} yazıyor...`; });
+    socket.on('stop typing', () => { typingEl.textContent = ''; });
+    socket.on('online users', (count) => { statusEl.textContent = `🟢 ${count} kişi çevrimiçi`; });
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+  </script>
+</body>
+</html>
