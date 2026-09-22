@@ -8,15 +8,18 @@ const io = new Server(server);
 
 app.use(express.static('public'));
 
-let onlineUsers = 0;
+// Çevrimiçi kullanıcıları tutan obje: { socketId: username }
+const onlineUsers = {};
 
 io.on('connection', (socket) => {
-  onlineUsers++;
-  console.log('Bağlandı:', socket.id, '| Toplam:', onlineUsers);
-  io.emit('online users', onlineUsers);
+  console.log('Bağlandı:', socket.id);
 
   socket.on('set username', (username) => {
     socket.username = username;
+    onlineUsers[socket.id] = username;
+
+    // Herkese güncel listeyi gönder
+    io.emit('users list', Object.values(onlineUsers));
     io.emit('system message', `${username} sohbete katıldı 👋`);
   });
 
@@ -33,12 +36,14 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    onlineUsers--;
-    io.emit('online users', onlineUsers);
-    if (socket.username) {
-      io.emit('system message', `${socket.username} sohbetten ayrıldı`);
+    const username = onlineUsers[socket.id];
+    delete onlineUsers[socket.id];
+
+    io.emit('users list', Object.values(onlineUsers));
+    if (username) {
+      io.emit('system message', `${username} sohbetten ayrıldı`);
     }
-    console.log('Ayrıldı:', socket.id, '| Toplam:', onlineUsers);
+    console.log('Ayrıldı:', socket.id);
   });
 });
 
