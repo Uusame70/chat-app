@@ -1,1 +1,8 @@
 node_modules/
+chat.db
+chat.db-journal
+chat.db-wal
+chat.db-shm
+.env
+public/uploads/
+public/avatars/
