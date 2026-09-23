@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -5,13 +7,19 @@ const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
 const multer = require('multer');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { pingTimeout: 60000, pingInterval: 25000, connectTimeout: 45000, maxHttpBufferSize: 10e6 });
+const io = new Server(server, { pingTimeout: 60000, pingInterval: 20000, connectTimeout: 60000, maxHttpBufferSize: 25e6 });
 
 app.use(express.static('public'));
+app.use(express.json());
+
+const JWT_SECRET = process.env.JWT_SECRET || 'degistir-bunu-gizli-anahtar-12345';
+const TOKEN_EXPIRY = '30d';
 
 // ==================== DOSYA YÜKLEME ====================
 const UPLOAD_DIR = path.join(__dirname, 'public', 'uploads');
@@ -46,15 +54,22 @@ db.exec(`
     time INTEGER NOT NULL,
     is_dm INTEGER DEFAULT 0,
     to_user TEXT DEFAULT NULL,
-    seen INTEGER DEFAULT 0
+    seen INTEGER DEFAULT 0,
+    reply_to_name TEXT DEFAULT NULL,
+    reply_to_text TEXT DEFAULT NULL,
+    reactions TEXT DEFAULT '{}'
   );
   CREATE TABLE IF NOT EXISTS rooms (
     name TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
-    owner TEXT DEFAULT NULL
+    owner TEXT DEFAULT NULL,
+    is_private INTEGER DEFAULT 0,
+    password_hash TEXT DEFAULT NULL
   );
   CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY,
+    password_hash TEXT DEFAULT NULL,
+    is_guest INTEGER DEFAULT 0,
     avatar TEXT DEFAULT NULL,
     status TEXT DEFAULT 'online',
     last_seen INTEGER DEFAULT 0
@@ -64,25 +79,38 @@ db.exec(`
 `);
 
 try { db.exec('ALTER TABLE messages ADD COLUMN seen INTEGER DEFAULT 0'); } catch (e) {}
+try { db.exec('ALTER TABLE messages ADD COLUMN reply_to_name TEXT DEFAULT NULL'); } catch (e) {}
+try { db.exec('ALTER TABLE messages ADD COLUMN reply_to_text TEXT DEFAULT NULL'); } catch (e) {}
+try { db.exec('ALTER TABLE messages ADD COLUMN reactions TEXT DEFAULT \'{}\''); } catch (e) {}
 try { db.exec('ALTER TABLE rooms ADD COLUMN owner TEXT DEFAULT NULL'); } catch (e) {}
+try { db.exec('ALTER TABLE rooms ADD COLUMN is_private INTEGER DEFAULT 0'); } catch (e) {}
+try { db.exec('ALTER TABLE rooms ADD COLUMN password_hash TEXT DEFAULT NULL'); } catch (e) {}
+try { db.exec('ALTER TABLE users ADD COLUMN password_hash TEXT DEFAULT NULL'); } catch (e) {}
+try { db.exec('ALTER TABLE users ADD COLUMN is_guest INTEGER DEFAULT 0'); } catch (e) {}
 
 const DEFAULT_ROOMS = ['genel', 'oyun', 'spor', 'sohbet'];
 const insertRoom = db.prepare('INSERT OR IGNORE INTO rooms (name, created_at, owner) VALUES (?, ?, NULL)');
 DEFAULT_ROOMS.forEach(r => insertRoom.run(r, Date.now()));
 
-const insertMsg = db.prepare('INSERT INTO messages (room, username, text, time, is_dm, to_user, seen) VALUES (?, ?, ?, ?, ?, ?, ?)');
+const insertMsg = db.prepare(
+  'INSERT INTO messages (room, username, text, time, is_dm, to_user, seen, reply_to_name, reply_to_text, reactions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+);
 const getRoomMessages = db.prepare('SELECT * FROM messages WHERE room = ? AND is_dm = 0 ORDER BY id DESC LIMIT 100');
-const getAllRooms = db.prepare('SELECT name, owner FROM rooms ORDER BY created_at');
+const getAllRooms = db.prepare('SELECT name, owner, is_private FROM rooms ORDER BY created_at');
 const markDMSeen = db.prepare('UPDATE messages SET seen = 1 WHERE id = ?');
+const getMsgById = db.prepare('SELECT * FROM messages WHERE id = ?');
+const updateReactions = db.prepare('UPDATE messages SET reactions = ? WHERE id = ?');
 
 const getUser = db.prepare('SELECT * FROM users WHERE username = ?');
-const upsertUser = db.prepare('INSERT INTO users (username, last_seen) VALUES (?, ?) ON CONFLICT(username) DO UPDATE SET last_seen = excluded.last_seen');
 const setAvatar = db.prepare('UPDATE users SET avatar = ? WHERE username = ?');
 const setStatus = db.prepare('UPDATE users SET status = ? WHERE username = ?');
+const createUser = db.prepare('INSERT INTO users (username, password_hash, is_guest, last_seen) VALUES (?, ?, 0, ?)');
+const createGuest = db.prepare('INSERT OR REPLACE INTO users (username, password_hash, is_guest, last_seen) VALUES (?, NULL, 1, ?)');
 
-// ==================== DURUM ====================
 const onlineUsers = {};
 const socketsByName = {};
+// Hangi kullanıcı hangi özel odaya girmiş: { username: Set<roomName> }
+const roomAccess = {};
 
 function dmRoomName(a, b) { return [a, b].sort().join('__DM__'); }
 function avatarFor(username) { const u = getUser.get(username); return u && u.avatar ? u.avatar : null; }
@@ -91,46 +119,152 @@ function usersWithAvatar() {
   return Object.values(onlineUsers).map(u => ({
     username: u.username, room: u.room,
     avatar: avatarFor(u.username),
-    status: (getUser.get(u.username) || {}).status || 'online'
+    status: (getUser.get(u.username) || {}).status || 'online',
+    isGuest: (getUser.get(u.username) || {}).is_guest === 1
   }));
 }
 
 function roomsData() { return getAllRooms.all(); }
+function validateUsername(name) { return /^[a-zA-Z0-9_-]{3,20}$/.test(name); }
+function makeToken(username) { return jwt.sign({ username }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY }); }
+function verifyToken(token) { try { return jwt.verify(token, JWT_SECRET).username; } catch (e) { return null; } }
+function guestName(base) { base = String(base || '').trim().slice(0, 15) || 'Misafir'; return '(misafir) ' + base; }
+
+function parseMsg(m) {
+  let reactions = {};
+  try { reactions = JSON.parse(m.reactions || '{}'); } catch (e) {}
+  return {
+    id: m.id, user: m.username, text: m.text, time: m.time, seen: m.seen,
+    avatar: avatarFor(m.username),
+    replyTo: m.reply_to_name ? { name: m.reply_to_name, text: m.reply_to_text } : null,
+    reactions
+  };
+}
+
+// ==================== AUTH ====================
+app.post('/api/register', async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!validateUsername(username)) return res.json({ error: 'Kullanıcı adı 3-20 karakter, harf/rakam/-/_ olabilir' });
+  if (!password || password.length < 4) return res.json({ error: 'Şifre en az 4 karakter olmalı' });
+  const existing = getUser.get(username);
+  if (existing && existing.password_hash) return res.json({ error: 'Bu kullanıcı adı zaten alınmış' });
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    if (existing) db.prepare('UPDATE users SET password_hash = ?, is_guest = 0 WHERE username = ?').run(hash, username);
+    else createUser.run(username, hash, Date.now());
+    res.json({ ok: true, username, token: makeToken(username) });
+  } catch (err) { res.json({ error: 'Kayıt başarısız' }); }
+});
+
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.json({ error: 'Kullanıcı adı ve şifre gerekli' });
+  const user = getUser.get(username);
+  if (!user || !user.password_hash) return res.json({ error: 'Kullanıcı bulunamadı veya şifre yanlış' });
+  try {
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.json({ error: 'Şifre yanlış' });
+    res.json({ ok: true, username, token: makeToken(username) });
+  } catch (err) { res.json({ error: 'Giriş başarısız' }); }
+});
+
+app.post('/api/auto-login', (req, res) => {
+  const { token } = req.body || {};
+  if (!token) return res.json({ error: 'Token yok' });
+  const username = verifyToken(token);
+  if (!username) return res.json({ error: 'Token geçersiz' });
+  const user = getUser.get(username);
+  if (!user || !user.password_hash) return res.json({ error: 'Kullanıcı bulunamadı' });
+  res.json({ ok: true, username, token });
+});
 
 // ==================== SOCKET.IO ====================
 io.on('connection', (socket) => {
-  console.log('[BAGLANDI]', socket.id);
+  socket.on('set username', (data) => {
+    let { username, isGuest, token } = data;
+    if (token) {
+      const verified = verifyToken(token);
+      if (verified && verified === username) {
+        const u = getUser.get(username);
+        if (u && u.password_hash) isGuest = false;
+      }
+    }
+    username = String(username).trim().slice(0, 25);
+    if (!username) return;
+    const finalName = isGuest ? guestName(username.replace(/^\(misafir\)\s*/, '')) : username;
 
-  socket.on('set username', (username) => {
-    username = String(username).trim().slice(0, 20);
-    if (!username) username = 'Anonim';
-
-    if (socketsByName[username] && socketsByName[username] !== socket.id) {
-      const oldSocket = io.sockets.sockets.get(socketsByName[username]);
+    if (socketsByName[finalName] && socketsByName[finalName] !== socket.id) {
+      const oldSocket = io.sockets.sockets.get(socketsByName[finalName]);
       if (oldSocket) oldSocket.disconnect(true);
     }
 
-    upsertUser.run(username, Date.now());
-    socket.username = username;
+    const existing = getUser.get(finalName);
+    if (!existing) {
+      if (isGuest) createGuest.run(finalName, Date.now());
+      else createUser.run(finalName, null, Date.now());
+    } else {
+      db.prepare('UPDATE users SET last_seen = ? WHERE username = ?').run(Date.now(), finalName);
+    }
+
+    socket.username = finalName;
     socket.room = 'genel';
-    onlineUsers[socket.id] = { username, room: 'genel' };
-    socketsByName[username] = socket.id;
+    socket.isGuest = isGuest;
+    onlineUsers[socket.id] = { username: finalName, room: 'genel', isGuest };
+    socketsByName[finalName] = socket.id;
+    roomAccess[finalName] = new Set(); // Erişim verilen özel odalar
     socket.join('genel');
 
     socket.emit('rooms list', roomsData());
     socket.emit('current room', 'genel');
-    socket.emit('history', { room: 'genel', messages: getRoomMessages.all('genel').reverse() });
+    socket.emit('history', { room: 'genel', messages: getRoomMessages.all('genel').reverse().map(parseMsg) });
 
-    const me = getUser.get(username);
-    socket.emit('me', { username, avatar: me ? me.avatar : null, status: me ? me.status : 'online' });
-    socket.to('genel').emit('system message', username + ' #genel odasına katıldı 👋');
+    const me = getUser.get(finalName);
+    socket.emit('me', { username: finalName, avatar: me ? me.avatar : null, status: me ? me.status : 'online', isGuest });
+
+    socket.to('genel').emit('system message', finalName + ' #genel odasına katıldı 👋');
     io.emit('users list', usersWithAvatar());
+  });
+
+  // ÖZEL ODA ŞİFRE KONTROLÜ
+  socket.on('check room access', (roomName) => {
+    if (!socket.username) return;
+    const room = db.prepare('SELECT * FROM rooms WHERE name = ?').get(roomName);
+    if (!room) return socket.emit('room access result', { room: roomName, allowed: false, error: 'Oda yok' });
+    if (!room.is_private) return socket.emit('room access result', { room: roomName, allowed: true });
+    const access = roomAccess[socket.username] || new Set();
+    if (access.has(roomName)) return socket.emit('room access result', { room: roomName, allowed: true });
+    socket.emit('room access result', { room: roomName, allowed: false, requiresPassword: true });
+  });
+
+  socket.on('verify room password', ({ roomName, password }) => {
+    if (!socket.username) return;
+    const room = db.prepare('SELECT * FROM rooms WHERE name = ?').get(roomName);
+    if (!room || !room.is_private) return;
+    bcrypt.compare(password || '', room.password_hash || '', (err, ok) => {
+      if (ok) {
+        if (!roomAccess[socket.username]) roomAccess[socket.username] = new Set();
+        roomAccess[socket.username].add(roomName);
+        socket.emit('room access granted', roomName);
+      } else {
+        socket.emit('room access denied', roomName);
+      }
+    });
   });
 
   socket.on('join room', (newRoom) => {
     if (!socket.username) return;
-    const roomExists = db.prepare('SELECT name FROM rooms WHERE name = ?').get(newRoom);
-    if (!roomExists) return;
+    const room = db.prepare('SELECT * FROM rooms WHERE name = ?').get(newRoom);
+    if (!room) return;
+
+    // Özel oda kontrolü
+    if (room.is_private) {
+      const access = roomAccess[socket.username] || new Set();
+      if (!access.has(newRoom) && room.owner !== socket.username) {
+        socket.emit('error message', 'Bu oda özel, önce şifre girmelisin');
+        return;
+      }
+    }
+
     const oldRoom = socket.room;
     if (oldRoom === newRoom) return;
 
@@ -138,80 +272,70 @@ io.on('connection', (socket) => {
     socket.to(oldRoom).emit('system message', socket.username + ' #' + oldRoom + ' odasından ayrıldı');
     socket.join(newRoom);
     socket.room = newRoom;
-    onlineUsers[socket.id] = { username: socket.username, room: newRoom };
+    onlineUsers[socket.id] = { username: socket.username, room: newRoom, isGuest: socket.isGuest };
 
     socket.emit('current room', newRoom);
-    socket.emit('history', { room: newRoom, messages: getRoomMessages.all(newRoom).reverse() });
+    socket.emit('history', { room: newRoom, messages: getRoomMessages.all(newRoom).reverse().map(parseMsg) });
     socket.to(newRoom).emit('system message', socket.username + ' #' + newRoom + ' odasına katıldı 👋');
     io.emit('users list', usersWithAvatar());
   });
 
-  // --- YENİ ODA ---
-  socket.on('create room', (name) => {
-    if (!socket.username) return;
-    name = String(name).trim().toLowerCase().replace(/[^a-z0-9-_]/g, '');
-    if (!name || name.length < 2 || name.length > 20) {
-      socket.emit('error message', 'Oda adı 2-20 karakter, sadece harf/rakam/-/_ olabilir');
-      return;
+  // YENİ ODA (özel/şifreli olabilir)
+  socket.on('create room', async ({ name, isPrivate, password }) => {
+    if (!socket.username || socket.isGuest) { socket.emit('error message', 'Misafirler oda oluşturamaz'); return; }
+    name = String(name || '').trim().toLowerCase().replace(/[^a-z0-9-_]/g, '');
+    if (!name || name.length < 2 || name.length > 20) { socket.emit('error message', 'Oda adı 2-20 karakter'); return; }
+    if (db.prepare('SELECT name FROM rooms WHERE name = ?').get(name)) { socket.emit('error message', 'Bu oda zaten var'); return; }
+
+    let hash = null;
+    if (isPrivate) {
+      if (!password || password.length < 3) { socket.emit('error message', 'Özel oda şifresi en az 3 karakter olmalı'); return; }
+      hash = await bcrypt.hash(password, 10);
     }
-    if (db.prepare('SELECT name FROM rooms WHERE name = ?').get(name)) {
-      socket.emit('error message', 'Bu oda zaten var');
-      return;
-    }
-    db.prepare('INSERT INTO rooms (name, created_at, owner) VALUES (?, ?, ?)').run(name, Date.now(), socket.username);
+
+    db.prepare('INSERT INTO rooms (name, created_at, owner, is_private, password_hash) VALUES (?, ?, ?, ?, ?)')
+      .run(name, Date.now(), socket.username, isPrivate ? 1 : 0, hash);
+
     io.emit('rooms list', roomsData());
-    io.emit('system message', socket.username + ' yeni oda açtı: #' + name);
-    console.log('[YENI ODA]', name, '| sahibi:', socket.username);
+    io.emit('system message', socket.username + (isPrivate ? ' özel' : ' yeni') + ' oda açtı: ' + (isPrivate ? '🔒 ' : '') + '#' + name);
   });
 
-  // --- ODA SİL ---
+  // ODA SİL
   socket.on('delete room', (name) => {
-    if (!socket.username) return;
+    if (!socket.username || socket.isGuest) { socket.emit('error message', 'Yetki yok'); return; }
     const room = db.prepare('SELECT * FROM rooms WHERE name = ?').get(name);
-    if (!room) { socket.emit('error message', 'Oda bulunamadı'); return; }
-    if (DEFAULT_ROOMS.includes(name)) { socket.emit('error message', 'Varsayılan oda silinemez'); return; }
-    if (room.owner !== socket.username) { socket.emit('error message', 'Bu odayı sadece sahibi silebilir'); return; }
+    if (!room || DEFAULT_ROOMS.includes(name)) { socket.emit('error message', 'Silinemez'); return; }
+    if (room.owner !== socket.username) { socket.emit('error message', 'Sadece sahibi silebilir'); return; }
 
     Object.entries(onlineUsers).forEach(([id, u]) => {
       if (u.room === name) {
         const s = io.sockets.sockets.get(id);
         if (s) {
-          s.leave(name);
-          s.join('genel');
-          s.room = 'genel';
+          s.leave(name); s.join('genel'); s.room = 'genel';
           onlineUsers[id].room = 'genel';
           s.emit('current room', 'genel');
-          s.emit('history', { room: 'genel', messages: getRoomMessages.all('genel').reverse() });
+          s.emit('history', { room: 'genel', messages: getRoomMessages.all('genel').reverse().map(parseMsg) });
         }
       }
     });
 
     db.prepare('DELETE FROM messages WHERE room = ? AND is_dm = 0').run(name);
     db.prepare('DELETE FROM rooms WHERE name = ?').run(name);
-
     io.emit('rooms list', roomsData());
     io.emit('users list', usersWithAvatar());
     io.emit('system message', '#' + name + ' odası silindi 🗑️');
-    console.log('[ODA SILINDI]', name);
   });
 
-  // --- ODA YENİDEN ADLANDIR ---
+  // ODA YENİDEN ADLANDIR
   socket.on('rename room', (data) => {
-    if (!socket.username) return;
+    if (!socket.username || socket.isGuest) { socket.emit('error message', 'Yetki yok'); return; }
     const oldName = data.oldName;
     let newName = String(data.newName || '').trim().toLowerCase().replace(/[^a-z0-9-_]/g, '');
-    if (!newName || newName.length < 2 || newName.length > 20) {
-      socket.emit('error message', 'Yeni oda adı 2-20 karakter olabilir');
-      return;
-    }
+    if (!newName || newName.length < 2 || newName.length > 20) { socket.emit('error message', 'Yeni ad 2-20 karakter'); return; }
     const room = db.prepare('SELECT * FROM rooms WHERE name = ?').get(oldName);
-    if (!room) { socket.emit('error message', 'Oda bulunamadı'); return; }
-    if (DEFAULT_ROOMS.includes(oldName)) { socket.emit('error message', 'Varsayılan oda yeniden adlandırılamaz'); return; }
-    if (room.owner !== socket.username) { socket.emit('error message', 'Bu odayı sadece sahibi değiştirebilir'); return; }
-    if (db.prepare('SELECT name FROM rooms WHERE name = ?').get(newName)) {
-      socket.emit('error message', 'Bu isim zaten kullanılıyor');
-      return;
-    }
+    if (!room || DEFAULT_ROOMS.includes(oldName)) { socket.emit('error message', 'Değiştirilemez'); return; }
+    if (room.owner !== socket.username) { socket.emit('error message', 'Sadece sahibi'); return; }
+    if (db.prepare('SELECT name FROM rooms WHERE name = ?').get(newName)) { socket.emit('error message', 'İsim kullanılıyor'); return; }
 
     db.prepare('UPDATE rooms SET name = ? WHERE name = ?').run(newName, oldName);
     db.prepare('UPDATE messages SET room = ? WHERE room = ? AND is_dm = 0').run(newName, oldName);
@@ -220,20 +344,31 @@ io.on('connection', (socket) => {
       if (u.room === oldName) {
         const s = io.sockets.sockets.get(id);
         if (s) {
-          s.leave(oldName);
-          s.join(newName);
-          s.room = newName;
+          s.leave(oldName); s.join(newName); s.room = newName;
           onlineUsers[id].room = newName;
           s.emit('current room', newName);
-          s.emit('history', { room: newName, messages: getRoomMessages.all(newName).reverse() });
+          s.emit('history', { room: newName, messages: getRoomMessages.all(newName).reverse().map(parseMsg) });
         }
       }
     });
 
     io.emit('rooms list', roomsData());
     io.emit('users list', usersWithAvatar());
-    io.emit('system message', '#' + oldName + ' → #' + newName + ' olarak değiştirildi ✏️');
-    console.log('[ODA RENAME]', oldName, '->', newName);
+    io.emit('system message', '#' + oldName + ' → #' + newName);
+  });
+
+  // ODA ŞİFRESİ DEĞİŞTİR
+  socket.on('change room password', async ({ name, newPassword }) => {
+    if (!socket.username || socket.isGuest) return;
+    const room = db.prepare('SELECT * FROM rooms WHERE name = ?').get(name);
+    if (!room || room.owner !== socket.username) { socket.emit('error message', 'Yetki yok'); return; }
+    if (!newPassword || newPassword.length < 3) { socket.emit('error message', 'Şifre en az 3 karakter'); return; }
+    const hash = await bcrypt.hash(newPassword, 10);
+    db.prepare('UPDATE rooms SET password_hash = ?, is_private = 1 WHERE name = ?').run(hash, name);
+    // Tüm erişimleri temizle
+    Object.values(roomAccess).forEach(set => set.delete(name));
+    io.emit('rooms list', roomsData());
+    io.emit('system message', '#' + name + ' odasının şifresi değiştirildi 🔐');
   });
 
   socket.on('chat message', (msg) => {
@@ -242,30 +377,65 @@ io.on('connection', (socket) => {
     const text = String(msg.text || '').slice(0, 2000);
     if (!text) return;
     const time = Date.now();
+    const replyName = msg.replyTo ? String(msg.replyTo.name || '').slice(0, 25) : null;
+    const replyText = msg.replyTo ? String(msg.replyTo.text || '').slice(0, 100) : null;
+
     let msgId = null;
-    try { msgId = insertMsg.run(room, socket.username, text, time, 0, null, 1).lastInsertRowid; } catch (e) {}
-    io.to(room).emit('chat message', { id: msgId, user: socket.username, text, room, time, seen: 1, avatar: avatarFor(socket.username) });
+    try { msgId = insertMsg.run(room, socket.username, text, time, 0, null, 1, replyName, replyText, '{}').lastInsertRowid; } catch (e) { console.error(e.message); }
+    const row = getMsgById.get(msgId);
+    io.to(room).emit('chat message', parseMsg(row));
   });
 
-  socket.on('dm message', ({ to, text }) => {
+  socket.on('dm message', ({ to, text, replyTo }) => {
     if (!socket.username) return;
     text = String(text || '').slice(0, 2000);
     if (!text || !to) return;
     const time = Date.now();
     const dmRoom = dmRoomName(socket.username, to);
     const targetOnline = !!socketsByName[to];
+    const replyName = replyTo ? String(replyTo.name || '').slice(0, 25) : null;
+    const replyText = replyTo ? String(replyTo.text || '').slice(0, 100) : null;
+
     let msgId = null;
-    try { msgId = insertMsg.run(dmRoom, socket.username, text, time, 1, to, targetOnline ? 1 : 0).lastInsertRowid; } catch (e) {}
-    const payload = { id: msgId, from: socket.username, to, text, time, seen: targetOnline ? 1 : 0, avatar: avatarFor(socket.username) };
+    try { msgId = insertMsg.run(dmRoom, socket.username, text, time, 1, to, targetOnline ? 1 : 0, replyName, replyText, '{}').lastInsertRowid; } catch (e) {}
+
+    const row = getMsgById.get(msgId);
+    const payload = { ...parseMsg(row), from: socket.username, to };
     const t = socketsByName[to];
     if (t) io.to(t).emit('dm message', payload);
     socket.emit('dm message', payload);
   });
 
+  socket.on('react', ({ msgId, emoji }) => {
+    if (!socket.username || !msgId || !emoji) return;
+    try {
+      const row = getMsgById.get(msgId);
+      if (!row) return;
+      let reactions = {};
+      try { reactions = JSON.parse(row.reactions || '{}'); } catch (e) {}
+      if (!reactions[emoji]) reactions[emoji] = [];
+      const idx = reactions[emoji].indexOf(socket.username);
+      if (idx >= 0) reactions[emoji].splice(idx, 1);
+      else reactions[emoji].push(socket.username);
+      if (reactions[emoji].length === 0) delete reactions[emoji];
+      updateReactions.run(JSON.stringify(reactions), msgId);
+
+      if (row.is_dm) {
+        const [u1, u2] = row.room.split('__DM__');
+        [u1, u2].forEach(u => {
+          const sid = socketsByName[u];
+          if (sid) io.to(sid).emit('reaction update', { msgId, reactions });
+        });
+      } else {
+        io.to(row.room).emit('reaction update', { msgId, reactions });
+      }
+    } catch (e) {}
+  });
+
   socket.on('dm seen', (msgId) => {
     try {
       markDMSeen.run(msgId);
-      const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(msgId);
+      const row = getMsgById.get(msgId);
       if (row) { const t = socketsByName[row.username]; if (t) io.to(t).emit('dm seen', msgId); }
     } catch (e) {}
   });
@@ -281,7 +451,7 @@ io.on('connection', (socket) => {
         if (t) io.to(t).emit('dm seen', m.id);
       }
     });
-    socket.emit('dm history', { with: to, messages: msgs.map(m => ({ ...m, avatar: avatarFor(m.username) })) });
+    socket.emit('dm history', { with: to, messages: msgs.map(parseMsg) });
   });
 
   socket.on('set status', (status) => {
@@ -299,24 +469,23 @@ io.on('connection', (socket) => {
     delete onlineUsers[socket.id];
     if (user && socketsByName[user.username] === socket.id) {
       delete socketsByName[user.username];
+      delete roomAccess[user.username];
       socket.to(user.room).emit('system message', user.username + ' sohbetten ayrıldı');
       io.emit('users list', usersWithAvatar());
     }
   });
 });
 
-// ==================== DOSYA YÜKLEME ROUTE ====================
+// ==================== DOSYA YÜKLEME ====================
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.json({ error: 'Dosya yok' });
   const url = '/uploads/' + req.file.filename;
   const isImage = /image\/(png|jpe?g|gif|webp)/.test(req.file.mimetype);
-  console.log('[DOSYA]', req.file.originalname, '->', url);
   res.json({ ok: true, url, name: req.file.originalname, isImage, size: req.file.size });
 });
 
-// ==================== AVATAR UPLOAD ====================
 app.post('/api/avatar', upload.single('avatar'), (req, res) => {
-  const username = String(req.query.username || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 20);
+  const username = String(req.query.username || '').replace(/[^a-zA-Z0-9_()\s-]/g, '').slice(0, 25);
   if (!username) return res.json({ error: 'Kullanıcı yok' });
   if (!req.file) return res.json({ error: 'Dosya yok' });
   if (!/image\//.test(req.file.mimetype)) return res.json({ error: 'Sadece resim' });
@@ -331,7 +500,7 @@ app.post('/api/avatar', upload.single('avatar'), (req, res) => {
 });
 
 // ==================== GIPHY ====================
-const GIPHY_API_KEY = process.env.GIPHY_API_KEY || 'NPtVMP5W2go2tGESyQ8qRq8iYE3TBqZx';
+const GIPHY_API_KEY = process.env.GIPHY_API_KEY || '';
 
 app.get('/api/gifs', async (req, res) => {
   const q = req.query.q || 'trending';
